@@ -29,6 +29,7 @@ import argparse
 import json
 import math
 import os
+import sqlite3
 import time
 import itertools
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -356,7 +357,7 @@ def print_report(N, pareto, intractable, stats) -> None:
 # 8. PIPELINE PRINCIPAL
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_pipeline(N, prime_bound, max_channels, max_tt, output_path, n_workers) -> None:
+def run_pipeline(N, prime_bound, max_channels, max_tt, output_path, n_workers, db_path=None) -> None:
 
     t_wall = time.perf_counter()
     timings = {}
@@ -485,11 +486,227 @@ def run_pipeline(N, prime_bound, max_channels, max_tt, output_path, n_workers) -
 
     print_report(N, evolvable, intractable, stats)
     export_results(N, evolvable, intractable, stats, output_path)
-    print(f"[✓] Resultados exportados para: {output_path}\n")
+    print(f"[✓] Resultados exportados para: {output_path}")
+
+    if db_path:
+        dump_to_sqlite(
+            db_path=db_path,
+            N=N,
+            prime_bound=prime_bound,
+            max_channels=max_channels,
+            max_tt_log2=int(math.log2(max_tt)),
+            pareto=evolvable,
+            intractable=intractable,
+            stats=stats,
+        )
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9. CLI
+# 9. PERSISTÊNCIA SQLite
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DDL = """
+CREATE TABLE IF NOT EXISTS runs (
+    run_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    N_bits        INTEGER NOT NULL,
+    prime_bound   INTEGER NOT NULL,
+    max_channels  INTEGER NOT NULL,
+    max_tt_log2   INTEGER NOT NULL,
+    workers       INTEGER NOT NULL,
+    total_combos  INTEGER NOT NULL,
+    after_filter  INTEGER NOT NULL,
+    pareto_size   INTEGER NOT NULL,
+    intractable   INTEGER NOT NULL,
+    elapsed_s     REAL    NOT NULL,
+    ran_at        TEXT    NOT NULL
+);
+
+-- Conjuntos não-dominados (e intratáveis) da fronteira de Pareto.
+-- set_hash = SHA-1 dos módulos ordenados: permite detectar o mesmo conjunto
+-- em execuções diferentes sem varrer a coluna moduli_json.
+CREATE TABLE IF NOT EXISTS pareto_sets (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id         INTEGER NOT NULL REFERENCES runs(run_id),
+    set_hash       TEXT    NOT NULL,
+    N_bits         INTEGER NOT NULL,
+    moduli_json    TEXT    NOT NULL,
+    M              INTEGER NOT NULL,
+    d1_waste       INTEGER NOT NULL,
+    d2_channels    INTEGER NOT NULL,
+    d3_delta_delay REAL    NOT NULL,
+    d4_converter   REAL    NOT NULL,
+    evolvability   INTEGER NOT NULL,
+    is_intractable INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(set_hash, run_id)
+);
+
+-- Módulos individuais normalizados: permite consultas do tipo
+-- "quais conjuntos contêm o módulo 31?" sem deserializar JSON.
+CREATE TABLE IF NOT EXISTS set_modules (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    set_id         INTEGER NOT NULL REFERENCES pareto_sets(id),
+    run_id         INTEGER NOT NULL REFERENCES runs(run_id),
+    modulus        INTEGER NOT NULL,
+    modulus_class  TEXT    NOT NULL,
+    bit_width      INTEGER NOT NULL,
+    carry_cascade  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pareto_run    ON pareto_sets(run_id);
+CREATE INDEX IF NOT EXISTS idx_pareto_hash   ON pareto_sets(set_hash);
+CREATE INDEX IF NOT EXISTS idx_pareto_N      ON pareto_sets(N_bits);
+CREATE INDEX IF NOT EXISTS idx_modules_set   ON set_modules(set_id);
+CREATE INDEX IF NOT EXISTS idx_modules_mod   ON set_modules(modulus);
+"""
+
+
+def dump_to_sqlite(
+    db_path:      str,
+    N:            int,
+    prime_bound:  int,
+    max_channels: int,
+    max_tt_log2:  int,
+    pareto:       list,
+    intractable:  list,
+    stats:        dict,
+) -> int:
+    """
+    Persiste os resultados de uma execução do pipeline em um banco SQLite.
+
+    Cria o arquivo e o schema automaticamente se o arquivo não existir.
+    Execuções repetidas acumulam histórico — nenhum dado anterior é
+    sobrescrito. Cada execução recebe um run_id único e incremental.
+
+    Parâmetros
+    ----------
+    db_path      : caminho do arquivo .db  (criado se ausente)
+    N            : largura dos operandos em bits
+    prime_bound  : limite máximo do pool de módulos
+    max_channels : k máximo permitido
+    max_tt_log2  : log2 do limiar de evolvabilidade usado no pruning
+    pareto       : conjuntos da fronteira de Pareto prontos para evolução
+    intractable  : conjuntos descartados por evolvabilidade
+    stats        : dicionário de metadados retornado pelo pipeline
+
+    Retorna
+    -------
+    run_id : identificador inteiro da execução recém-inserida
+
+    Schema
+    ------
+    runs        — metadados de cada execução (1 linha por chamada)
+    pareto_sets — conjuntos não-dominados e intratáveis (N linhas)
+    set_modules — módulos individuais normalizados (N×k linhas)
+
+    Exemplos de consultas úteis
+    ---------------------------
+    -- Todos os conjuntos Pareto para N=8:
+    SELECT moduli_json, d1_waste, d2_channels, d3_delta_delay, d4_converter
+    FROM pareto_sets WHERE N_bits=8 AND is_intractable=0;
+
+    -- Quais conjuntos contêm o módulo 31?
+    SELECT ps.moduli_json FROM set_modules sm
+    JOIN pareto_sets ps ON sm.set_id = ps.id
+    WHERE sm.modulus=31 AND ps.is_intractable=0;
+
+    -- Histórico de execuções:
+    SELECT run_id, N_bits, prime_bound, pareto_size, elapsed_s, ran_at
+    FROM runs ORDER BY ran_at DESC;
+    """
+    import hashlib
+    from datetime import datetime, timezone
+
+    is_new = not os.path.exists(db_path)
+    con = sqlite3.connect(db_path)
+    con.execute("PRAGMA journal_mode=WAL")   # seguro para writes concorrentes futuros
+    con.execute("PRAGMA foreign_keys=ON")
+
+    try:
+        con.executescript(_DDL)
+
+        # ── Inserir metadados da execução ────────────────────────────────────
+        cur = con.execute(
+            """
+            INSERT INTO runs
+                (N_bits, prime_bound, max_channels, max_tt_log2, workers,
+                 total_combos, after_filter, pareto_size, intractable,
+                 elapsed_s, ran_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                N, prime_bound, max_channels, max_tt_log2,
+                stats["workers"],
+                stats["total_combos"],
+                stats["after_filter"],
+                len(pareto),
+                len(intractable),
+                round(stats["elapsed"], 6),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        run_id = cur.lastrowid
+
+        # ── Inserir conjuntos: fronteira de Pareto + intratáveis ─────────────
+        all_sets = [(s, 0) for s in pareto] + [(s, 1) for s in intractable]
+
+        for s, flag in all_sets:
+            moduli_sorted = tuple(sorted(s.moduli))
+            set_hash = hashlib.sha1(
+                ",".join(str(m) for m in moduli_sorted).encode()
+            ).hexdigest()
+
+            cur2 = con.execute(
+                """
+                INSERT OR IGNORE INTO pareto_sets
+                    (run_id, set_hash, N_bits, moduli_json, M,
+                     d1_waste, d2_channels, d3_delta_delay, d4_converter,
+                     evolvability, is_intractable)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id, set_hash, s.N,
+                    json.dumps(list(moduli_sorted)),
+                    s.M,
+                    s.d1_waste, s.d2_channels,
+                    s.d3_delta_delay,
+                    round(s.d4_converter, 6),
+                    s.evolvability,
+                    flag,
+                ),
+            )
+            set_id = cur2.lastrowid
+
+            # ── Módulos individuais normalizados ─────────────────────────────
+            con.executemany(
+                """
+                INSERT INTO set_modules
+                    (set_id, run_id, modulus, modulus_class, bit_width, carry_cascade)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (set_id, run_id, m, cls, m.bit_length(), _carry_cascade(m))
+                    for m, cls in zip(s.moduli, s.classes)
+                ],
+            )
+
+        con.commit()
+
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+    action = "criado" if is_new else "atualizado"
+    print(f"\n[DB] Banco {action}: {db_path!r}")
+    print(f"     run_id={run_id}  |  "
+          f"{len(pareto)} conjuntos Pareto + {len(intractable)} intratáveis persistidos")
+    return run_id
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -509,6 +726,8 @@ def main():
         help="Número de processos worker. Padrão: os.cpu_count().")
     parser.add_argument("--output", "-o", type=str, default=None,
         help="Arquivo JSON de saída. Padrão: pareto_front_N<bits>.json")
+    parser.add_argument("--db", type=str, default=None,
+        help="Arquivo SQLite para persistência. Criado automaticamente se ausente.")
 
     args        = parser.parse_args()
     N           = args.bits
@@ -524,6 +743,7 @@ def main():
         max_tt=max_tt,
         output_path=output_path,
         n_workers=n_workers,
+        db_path=args.db,
     )
 
 
